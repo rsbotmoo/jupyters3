@@ -332,7 +332,7 @@ def _file_exists(context, path):
         try:
             response = yield _make_s3_request(context, 'HEAD', '/' + key, {}, {}, b'')
         except HTTPClientError as exception:
-            if exception.response.code != 404:
+            if exception.response.code != 404 and exception.response.code != 403:
                 raise HTTPServerError(exception.response.code, 'Error checking if S3 exists')
             response = exception.response
 
