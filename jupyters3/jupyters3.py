@@ -718,7 +718,7 @@ def _copy(context, from_path, to_path):
         from_dir
 
     if (yield _dir_exists(context, to_path)):
-        copy_pat = re.compile(r'\-Copy\d*\.')f
+        copy_pat = re.compile(r'\-Copy\d*\.')
         name = copy_pat.sub(u'.', from_name)
         to_name = yield _increment_filename(context, name, to_path, insert='-Copy')
         to_path = u'{0}/{1}'.format(to_path, to_name)
