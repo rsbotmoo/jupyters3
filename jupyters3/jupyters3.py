@@ -356,13 +356,15 @@ def _get(context, path, content, type, format):
 @gen.coroutine
 def _get_notebook(context, path, content):
     notebook_dict = yield _get_any(context, path, content, 'notebook', None, 'json', lambda file_bytes: json.loads(file_bytes.decode('utf-8')))
+    print(notebook_dict)
     stringified = ""
-    for cell in notebook_dict['cells']:
+    nb = json.loads(json.dumps(notebook_dict))
+    for cell in nb['cells']:
         for source in cell['source']:
             stringified = stringified + source
             cell['source'] = stringified
         stringified = ""
-    return nbformat.from_dict(notebook_dict)
+    return nbformat.from_dict(nb)
 
 @gen.coroutine
 def _get_file_base64(context, path, content):
