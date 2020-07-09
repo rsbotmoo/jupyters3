@@ -357,11 +357,11 @@ def _get(context, path, content, type, format):
 def _get_notebook(context, path, content):
     notebook_dict = yield _get_any(context, path, content, 'notebook', None, 'json', lambda file_bytes: json.loads(file_bytes.decode('utf-8')))
     stringified = ""
-        for cell in notebook_dict['cells']:
-            for source in cell['source']:
-                stringified = stringified + source
-                cell['source'] = stringified
-            stringified = ""
+    for cell in notebook_dict['cells']:
+        for source in cell['source']:
+            stringified = stringified + source
+            cell['source'] = stringified
+        stringified = ""
     return nbformat.from_dict(notebook_dict)
 
 @gen.coroutine
@@ -718,7 +718,7 @@ def _copy(context, from_path, to_path):
         from_dir
 
     if (yield _dir_exists(context, to_path)):
-        copy_pat = re.compile(r'\-Copy\d*\.')
+        copy_pat = re.compile(r'\-Copy\d*\.')f
         name = copy_pat.sub(u'.', from_name)
         to_name = yield _increment_filename(context, name, to_path, insert='-Copy')
         to_path = u'{0}/{1}'.format(to_path, to_name)
