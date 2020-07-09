@@ -356,9 +356,8 @@ def _get(context, path, content, type, format):
 @gen.coroutine
 def _get_notebook(context, path, content):
     notebook_dict = yield _get_any(context, path, content, 'notebook', None, 'json', lambda file_bytes: json.loads(file_bytes.decode('utf-8')))
-    print(notebook_dict)
     stringified = ""
-    nb = json.loads(json.dumps(notebook_dict))
+    nb = json.loads(json.dumps(notebook_dict, indent=4, sort_keys=True, default=str))
     for cell in nb['cells']:
         for source in cell['source']:
             stringified = stringified + source
