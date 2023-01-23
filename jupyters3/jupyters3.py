@@ -35,9 +35,10 @@ from traitlets import (
 
 import nbformat
 from nbformat.v4 import new_notebook
-from notebook.services.contents.manager import (
-    ContentsManager,
-)
+# from jupyter_server.services.contents.manager.ContentsManager import (
+#     ContentsManager,
+# )
+from jupyter_server.services.contents.manager import(ContentsManager)
 
 DIRECTORY_SUFFIX = '/'
 NOTEBOOK_SUFFIX = '.ipynb'

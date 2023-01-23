@@ -1,0 +1,8 @@
+.DS_Store
+
+# Module directory
+.git/
+.terraform
+generated-templates/
+.idea/
+venv/
