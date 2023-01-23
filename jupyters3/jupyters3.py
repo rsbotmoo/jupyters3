@@ -35,9 +35,7 @@ from traitlets import (
 
 import nbformat
 from nbformat.v4 import new_notebook
-# from jupyter_server.services.contents.manager.ContentsManager import (
-#     ContentsManager,
-# )
+
 from jupyter_server.services.contents.manager import(ContentsManager)
 
 DIRECTORY_SUFFIX = '/'
@@ -45,7 +43,7 @@ NOTEBOOK_SUFFIX = '.ipynb'
 CHECKPOINT_SUFFIX = '.checkpoints'
 UNTITLED_NOTEBOOK = 'Untitled'
 UNTITLED_FILE = 'Untitled'
-UNTITLED_DIRECTORY  = 'Untitled Folder'
+UNTITLED_DIRECTORY  = 'Untitled-Folder'
 
 Context = namedtuple('Context', [
     'logger', 'prefix', 'region', 's3_bucket', 's3_host', 's3_auth',
