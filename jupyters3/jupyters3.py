@@ -43,7 +43,7 @@ NOTEBOOK_SUFFIX = '.ipynb'
 CHECKPOINT_SUFFIX = '.checkpoints'
 UNTITLED_NOTEBOOK = 'Untitled'
 UNTITLED_FILE = 'Untitled'
-UNTITLED_DIRECTORY  = 'Untitled-Folder'
+UNTITLED_DIRECTORY  = 'UntitledFolder'
 
 Context = namedtuple('Context', [
     'logger', 'prefix', 'region', 's3_bucket', 's3_host', 's3_auth',
@@ -466,6 +466,7 @@ def _save_file_text(context, chunk, content, path):
 
 @gen.coroutine
 def _save_directory(context, chunk, content, path):
+    print("Saving directory",path)
     return (yield _save_any(context, chunk, b'', path + DIRECTORY_SUFFIX, 'directory', None))
 
 
@@ -474,7 +475,7 @@ def _save_any(context, chunk, content_bytes, path, type, mimetype):
     response = \
         (yield _save_bytes(context, content_bytes, path, type, mimetype)) if chunk is None else \
         (yield _save_chunk(context, chunk, content_bytes, path, type, mimetype))
-
+    print(response)
     return response
 
 
