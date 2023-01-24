@@ -216,7 +216,7 @@ class JupyterS3(ContentsManager):
 
     @gen.coroutine
     def new_untitled(self, path='', type='', ext=''):
-        print("New untitled -> path:",)
+        #print("New untitled -> path:",)
         with (yield self.write_lock.acquire()):
             return (yield _new_untitled(self._context(), path, type, ext))
 
@@ -314,7 +314,7 @@ def _type_from_path_not_directory(path):
 
 @gen.coroutine
 def _dir_exists(context, path):
-    print("IN DIR exist")
+    #print("IN DIR exist")
     return True if _is_root(path) else (yield _file_exists(context, path + DIRECTORY_SUFFIX))
 
 
@@ -326,16 +326,16 @@ def _is_root(path):
 
 @gen.coroutine
 def _file_exists(context, path):
-    print("IN file exist")
+    #print("IN file exist")
     @gen.coroutine
     def key_exists():
-        print("IN KEY EXIST")
+        #print("IN KEY EXIST")
         key = _key(context, path)
         try:
             response = yield _make_s3_request(context, 'HEAD', '/' + key, {}, {}, b'')
             print(response)
         except HTTPClientError as exception:
-            print("Error in checking key")
+            #print("Error in checking key")
             if exception.response.code != 404 and exception.response.code != 403:
                 raise HTTPServerError(exception.response.code, 'Error checking if S3 exists')
             response = exception.response
@@ -471,7 +471,7 @@ def _save_file_text(context, chunk, content, path):
 
 @gen.coroutine
 def _save_directory(context, chunk, content, path):
-    print("Saving directory",path)
+    #print("Saving directory",path)
     return (yield _save_any(context, chunk, b'', path + DIRECTORY_SUFFIX, 'directory', None))
 
 
@@ -679,7 +679,7 @@ def _new_untitled(context, path, type, ext):
         UNTITLED_NOTEBOOK if model_type == 'notebook' else \
         UNTITLED_FILE
     insert = \
-        ' ' if model_type == 'directory' else \
+        '' if model_type == 'directory' else \
         ''
     ext = \
         '.ipynb' if model_type == 'notebook' else \
@@ -687,7 +687,7 @@ def _new_untitled(context, path, type, ext):
 
     name = yield _increment_filename(context, untitled + ext, path, insert=insert)
     path = u'{0}/{1}'.format(path, name)
-    print("creating new: ",name," in path: ",path)
+    #print("creating new: ",path)
 
     model = {
         'type': model_type,
