@@ -3,6 +3,7 @@ import base64
 from collections import namedtuple
 import datetime
 import hashlib
+import functools
 import hmac
 import itertools
 import json
@@ -20,6 +21,13 @@ from tornado.httpclient import (
     HTTPError as HTTPClientError,
     HTTPRequest,
 )
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
 from tornado.ioloop import IOLoop
 from tornado.locks import Lock
 from tornado.web import HTTPError as HTTPServerError
@@ -73,22 +81,50 @@ class ExpiringDict:
         self._store = {}
 
     def _remove_old_keys(self, now):
-        self._store = {key: (expires, value) for key, (expires, value) in self._store.items() if expires > now}
+        self._store = {
+            key: (expires, value)
+            for key, (expires, value) in self._store.items()
+            if expires > now
+        }
 
     def __getitem__(self, key):
-        now = int(time.time())
+        now = int(time.monotonic())
         self._remove_old_keys(now)
         return self._store[key][1]
 
     def __setitem__(self, key, value):
-        now = int(time.time())
+        now = int(time.monotonic())
         self._remove_old_keys(now)
         self._store[key] = (now + self._seconds, value)
 
     def __delitem__(self, key):
-        now = int(time.time())
+        now = int(time.monotonic())
         self._remove_old_keys(now)
         del self._store[key]
+
+    def __contains__(self, key):
+        try:
+            _ = self[key]
+            return True
+        except KeyError:
+            return False
+
+
+# ---------------------------------------------------------------------
+# Helpers shared across the module
+
+# (1) Single HTTP client for connection pooling / DNS cache
+HTTP_CLIENT = AsyncHTTPClient(max_clients=64)
+
+
+# (2) Small LRU cache for MIME look-ups
+@functools.lru_cache(maxsize=256)
+def _cached_guess_mimetype(path: str):
+    return mimetypes.guess_type(path)[0]
+
+
+# (3) Pre-compiled regex used in _copy
+_COPY_REGEX = re.compile(r"\-Copy\d*\.")
 
 
 class Datetime(TraitType):
@@ -127,15 +163,21 @@ class JupyterS3ECSRoleAuthentication(JupyterS3Authentication):
 
         if now > self.expiration:
             request = HTTPRequest(
-                "http://169.254.170.2" + os.environ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"], method="GET"
+                "http://169.254.170.2"
+                + os.environ["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"],
+                method="GET",
             )
-            creds = json.loads((yield AsyncHTTPClient().fetch(request)).body.decode("utf-8"))
+            creds = json.loads(
+                (yield AsyncHTTPClient().fetch(request)).body.decode("utf-8")
+            )
             self.aws_access_key_id = creds["AccessKeyId"]
             self.aws_secret_access_key = creds["SecretAccessKey"]
             self.pre_auth_headers = {
                 "x-amz-security-token": creds["Token"],
             }
-            self.expiration = datetime.datetime.strptime(creds["Expiration"], "%Y-%m-%dT%H:%M:%SZ")
+            self.expiration = datetime.datetime.strptime(
+                creds["Expiration"], "%Y-%m-%dT%H:%M:%SZ"
+            )
 
         return AwsCreds(
             access_key_id=self.aws_access_key_id,
@@ -299,24 +341,21 @@ def _type_from_path(context, path):
     type = (
         "notebook"
         if path.endswith(NOTEBOOK_SUFFIX)
-        else "directory"
-        if _is_root(path) or (yield _dir_exists(context, path))
-        else "file"
+        else (
+            "directory"
+            if _is_root(path) or (yield _dir_exists(context, path))
+            else "file"
+        )
     )
     return type
 
 
 def _format_from_type_and_path(context, type, path):
-    type = (
+    return (
         "json"
-        if type == "notebook"
-        else "json"
-        if type == "directory"
-        else "text"
-        if mimetypes.guess_type(path)[0] == "text/plain"
-        else "base64"
+        if type in ("notebook", "directory")
+        else "text" if _cached_guess_mimetype(path) == "text/plain" else "base64"
     )
-    return type
 
 
 def _type_from_path_not_directory(path):
@@ -326,8 +365,20 @@ def _type_from_path_not_directory(path):
 
 @gen.coroutine
 def _dir_exists(context, path):
-    # print("IN DIR exist")
-    return True if _is_root(path) else (yield _file_exists(context, path + DIRECTORY_SUFFIX))
+    # Root always exists
+    if _is_root(path):
+        return True
+
+    # 1️⃣ traditional folder-marker object (kept for backward-compat)
+    if (yield _file_exists(context, path + DIRECTORY_SUFFIX)):
+        return True
+
+    # 2️⃣ otherwise: does *anything* live under this prefix?
+    key_prefix = _key(context, path)
+    key_prefix = key_prefix if key_prefix.endswith("/") else key_prefix + "/"
+
+    keys, dirs = yield _list_immediate_child_keys_and_directories(context, key_prefix)
+    return bool(keys or dirs)
 
 
 def _is_root(path):
@@ -345,11 +396,14 @@ def _file_exists(context, path):
         key = _key(context, path)
         try:
             response = yield _make_s3_request(context, "HEAD", "/" + key, {}, {}, b"")
-            print(response)
+            context.logger.debug("HEAD %s â†’ %s", key, response.code)
+
         except HTTPClientError as exception:
             # print("Error in checking key")
             if exception.response.code != 404 and exception.response.code != 403:
-                raise HTTPServerError(exception.response.code, "Error checking if S3 exists")
+                raise HTTPServerError(
+                    exception.response.code, "Error checking if S3 exists"
+                )
             response = exception.response
 
         return response.code == 200
@@ -365,8 +419,19 @@ def _exists(context, path):
 @gen.coroutine
 def _get(context, path, content, type, format):
     type_to_get = type if type is not None else (yield _type_from_path(context, path))
-    format_to_get = format if format is not None else _format_from_type_and_path(context, type_to_get, path)
-    return (yield GETTERS[(type_to_get, format_to_get)](context, path, content))
+    format_to_get = (
+        format
+        if format is not None
+        else _format_from_type_and_path(context, type_to_get, path)
+    )
+    try:
+        return (yield GETTERS[(type_to_get, format_to_get)](context, path, content))
+    except HTTPClientError as exc:
+        # The key really is missing (404) or access-denied (403):
+        # surface as a normal 404 so JupyterLab shows a toast instead of 500.
+        if exc.response.code in (403, 404):
+            raise HTTPServerError(exc.response.code, "No such file or directory")
+        raise
 
 
 @gen.coroutine
@@ -412,7 +477,13 @@ def _get_file_base64(context, path, content):
 def _get_file_text(context, path, content):
     return (
         yield _get_any(
-            context, path, content, "file", "text/plain", "text", lambda file_bytes: file_bytes.decode("utf-8")
+            context,
+            path,
+            content,
+            "file",
+            "text/plain",
+            "text",
+            lambda file_bytes: file_bytes.decode("utf-8"),
         )
     )
 
@@ -424,7 +495,9 @@ def _get_any(context, path, content, type, mimetype, format, decode):
     response = yield _make_s3_request(context, method, "/" + key, {}, {}, b"")
     file_bytes = response.body
     last_modified_str = response.headers["Last-Modified"]
-    last_modified = datetime.datetime.strptime(last_modified_str, "%a, %d %b %Y %H:%M:%S GMT")
+    last_modified = datetime.datetime.strptime(
+        last_modified_str, "%a, %d %b %Y %H:%M:%S GMT"
+    )
     return {
         "name": _final_path_component(path),
         "path": path,
@@ -442,7 +515,11 @@ def _get_any(context, path, content, type, mimetype, format, decode):
 def _get_directory(context, path, content):
     key = _key(context, path)
     key_prefix = key if (key == "" or key[-1] == "/") else (key + "/")
-    keys, directories = (yield _list_immediate_child_keys_and_directories(context, key_prefix)) if content else ([], [])
+    keys, directories = (
+        (yield _list_immediate_child_keys_and_directories(context, key_prefix))
+        if content
+        else ([], [])
+    )
 
     all_keys = {key for (key, _) in keys}
 
@@ -456,35 +533,43 @@ def _get_directory(context, path, content):
         "created": datetime.datetime.fromtimestamp(86400),
         "format": "json" if content else None,
         "content": (
-            [
-                {
-                    "type": "directory",
-                    "name": _final_path_component(directory),
-                    "path": _path(context, directory),
-                }
-                for directory in directories
-                if directory not in all_keys
-            ]
-            + [
-                {
-                    "type": _type_from_path_not_directory(key),
-                    "name": _final_path_component(key),
-                    "path": _path(context, key),
-                    "last_modified": last_modified,
-                }
-                for (key, last_modified) in keys
-                if not key.endswith(DIRECTORY_SUFFIX)
-            ]
-        )
-        if content
-        else None,
+            (
+                [
+                    {
+                        "type": "directory",
+                        "name": _final_path_component(directory),
+                        "path": _path(context, directory),
+                    }
+                    for directory in directories
+                    if directory not in all_keys
+                ]
+                + [
+                    {
+                        "type": _type_from_path_not_directory(key),
+                        "name": _final_path_component(key),
+                        "path": _path(context, key),
+                        "last_modified": last_modified,
+                    }
+                    for (key, last_modified) in keys
+                    if not key.endswith(DIRECTORY_SUFFIX)
+                ]
+            )
+            if content
+            else None
+        ),
     }
 
 
 @gen.coroutine
 def _save(context, model, path):
-    type_to_save = model["type"] if "type" in model else (yield _type_from_path(context, path))
-    format_to_save = model["format"] if "format" in model else _format_from_type_and_path(context, type_to_save, path)
+    type_to_save = (
+        model["type"] if "type" in model else (yield _type_from_path(context, path))
+    )
+    format_to_save = (
+        model["format"]
+        if "format" in model
+        else _format_from_type_and_path(context, type_to_save, path)
+    )
     return (
         yield SAVERS[(type_to_save, format_to_save)](
             context,
@@ -497,27 +582,46 @@ def _save(context, model, path):
 
 @gen.coroutine
 def _save_notebook(context, chunk, content, path):
-    return (yield _save_any(context, chunk, json.dumps(content).encode("utf-8"), path, "notebook", None))
+    return (
+        yield _save_any(
+            context, chunk, json.dumps(content).encode("utf-8"), path, "notebook", None
+        )
+    )
 
 
 @gen.coroutine
 def _save_file_base64(context, chunk, content, path):
     return (
         yield _save_any(
-            context, chunk, base64.b64decode(content.encode("utf-8")), path, "file", "application/octet-stream"
+            context,
+            chunk,
+            base64.b64decode(content.encode("utf-8")),
+            path,
+            "file",
+            "application/octet-stream",
         )
     )
 
 
 @gen.coroutine
 def _save_file_text(context, chunk, content, path):
-    return (yield _save_any(context, chunk, content.encode("utf-8"), path, "file", "text/plain"))
+    return (
+        yield _save_any(
+            context, chunk, content.encode("utf-8"), path, "file", "text/plain"
+        )
+    )
 
 
 @gen.coroutine
 def _save_directory(context, chunk, content, path):
     # print("Saving directory",path)
-    return (yield _save_any(context, chunk, b"", path + DIRECTORY_SUFFIX, "directory", None))
+    model = yield _save_any(
+        context, chunk, b"", path + DIRECTORY_SUFFIX, "directory", None
+    )
+    # strip the trailing "/" before we hand the model back to Lab
+    model["path"] = path
+    model["name"] = _final_path_component(path)
+    return model
 
 
 @gen.coroutine
@@ -527,7 +631,7 @@ def _save_any(context, chunk, content_bytes, path, type, mimetype):
         if chunk is None
         else (yield _save_chunk(context, chunk, content_bytes, path, type, mimetype))
     )
-    print(response)
+    context.logger.debug("Saved %s bytes to '%s'", len(content_bytes), path)
     return response
 
 
@@ -553,7 +657,9 @@ def _save_bytes(context, content_bytes, path, type, mimetype):
     response = yield _make_s3_request(context, "PUT", "/" + key, {}, {}, content_bytes)
 
     last_modified_str = response.headers["Date"]
-    last_modified = datetime.datetime.strptime(last_modified_str, "%a, %d %b %Y %H:%M:%S GMT")
+    last_modified = datetime.datetime.strptime(
+        last_modified_str, "%a, %d %b %Y %H:%M:%S GMT"
+    )
     return _saved_model(path, type, mimetype, last_modified)
 
 
@@ -632,7 +738,12 @@ def _list_checkpoints(context, path):
     keys, _ = yield _list_immediate_child_keys_and_directories(context, key_prefix)
     return [
         {
-            "id": key[(key.rfind("/" + CHECKPOINT_SUFFIX + "/") + len("/" + CHECKPOINT_SUFFIX + "/")) :],
+            "id": key[
+                (
+                    key.rfind("/" + CHECKPOINT_SUFFIX + "/")
+                    + len("/" + CHECKPOINT_SUFFIX + "/")
+                ) :
+            ],
             "last_modified": last_modified,
         }
         for key, last_modified in keys
@@ -657,17 +768,22 @@ def _rename(context, old_path, new_path):
     object_key = [] if type == "directory" else [(old_key, new_key)]
 
     renames = object_key + [
-        (key, replace_key_prefix(key)) for (key, _) in (yield _list_all_descendant_keys(context, old_key + "/"))
+        (key, replace_key_prefix(key))
+        for (key, _) in (yield _list_all_descendant_keys(context, old_key + "/"))
     ]
 
     # We can't really do a transaction on S3, and not sure if we can trust that on any error
     # from DELETE, that the DELETE hasn't happened: even checking if the file is still there
     # isn't bulletproof due to eventual consistency. So we risk duplicate files over risking
     # deleted files
-    for old_key, new_key in object_key + sorted(renames, key=lambda k: _copy_sort_key(k[0])):
+    for old_key, new_key in object_key + sorted(
+        renames, key=lambda k: _copy_sort_key(k[0])
+    ):
         yield _copy_key(context, old_key, new_key)
 
-    for old_key, _ in sorted(renames, key=lambda k: _delete_sort_key(k[0])) + object_key:
+    for old_key, _ in (
+        sorted(renames, key=lambda k: _delete_sort_key(k[0])) + object_key
+    ):
         yield _delete_key(context, old_key)
 
     return (yield _get(context, new_path, content=False, type=None, format=None))
@@ -692,10 +808,37 @@ def _delete(context, path):
 
     object_key = [] if type == "directory" else [root_key]
 
-    descendant_keys = [key for (key, _) in (yield _list_all_descendant_keys(context, root_key + "/"))]
+    descendant_keys = [
+        key for (key, _) in (yield _list_all_descendant_keys(context, root_key + "/"))
+    ]
 
-    for key in sorted(descendant_keys, key=_delete_sort_key) + object_key:
-        yield _delete_key(context, key)
+    all_keys = sorted(descendant_keys, key=_delete_sort_key) + object_key
+    yield _delete_keys(context, all_keys)
+
+
+# More efficient batch delete (up to 1 000 objects per call)
+@gen.coroutine
+def _delete_keys(context, keys):
+    for i in range(0, len(keys), 1000):
+        chunk = keys[i : i + 1000]
+        if not chunk:
+            return
+
+        import xml.sax.saxutils as _xml
+
+        xml_body = (
+            "<Delete>"
+            + "".join(f"<Object><Key>{_xml.escape(k)}</Key></Object>" for k in chunk)
+            + "<Quiet>true</Quiet></Delete>"
+        ).encode()
+
+        md5 = base64.b64encode(hashlib.md5(xml_body).digest()).decode()
+        headers = {
+            "Content-MD5": md5,
+            "Content-Type": "application/xml",  # <- tell Tornado/S3 it’s raw XML
+        }
+
+        yield _make_s3_request(context, "POST", "/", {"delete": ""}, headers, xml_body)
 
 
 @gen.coroutine
@@ -713,9 +856,7 @@ def _new_untitled(context, path, type, ext):
     untitled = (
         UNTITLED_DIRECTORY
         if model_type == "directory"
-        else UNTITLED_NOTEBOOK
-        if model_type == "notebook"
-        else UNTITLED_FILE
+        else UNTITLED_NOTEBOOK if model_type == "notebook" else UNTITLED_FILE
     )
     insert = "" if model_type == "directory" else ""
     ext = ".ipynb" if model_type == "notebook" else ext
@@ -753,13 +894,14 @@ def _copy(context, from_path, to_path):
     if model["type"] == "directory":
         raise HTTPServerError(400, "Can't copy directories")
 
-    from_dir, from_name = from_path.rsplit("/", 1) if "/" in from_path else ("", from_path)
+    from_dir, from_name = (
+        from_path.rsplit("/", 1) if "/" in from_path else ("", from_path)
+    )
 
     to_path = to_path if to_path is not None else from_dir
 
     if (yield _dir_exists(context, to_path)):
-        copy_pat = re.compile(r"\-Copy\d*\.")
-        name = copy_pat.sub(".", from_name)
+        name = _COPY_REGEX.sub(".", from_name)
         to_name = yield _increment_filename(context, name, to_path, insert="-Copy")
         to_path = "{0}/{1}".format(to_path, to_name)
 
@@ -825,7 +967,9 @@ def _list_keys(context, key_prefix, delimeter):
             if el.tag == f"{namespace}Contents":
                 key = _first_child_text(el, f"{namespace}Key")
                 last_modified_str = _first_child_text(el, f"{namespace}LastModified")
-                last_modified = datetime.datetime.strptime(last_modified_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                last_modified = datetime.datetime.strptime(
+                    last_modified_str, "%Y-%m-%dT%H:%M:%S.%fZ"
+                )
                 keys.append((key, last_modified))
             if el.tag == f"{namespace}CommonPrefixes":
                 # Prefixes end in '/', which we strip off
@@ -868,13 +1012,16 @@ def _make_s3_request(context, method, path, query, api_pre_auth_headers, payload
 
     querystring = urllib.parse.urlencode(query, safe="~", quote_via=urllib.parse.quote)
     encoded_path = urllib.parse.quote(full_path, safe="/~")
-    url = f"https://{context.s3_host}{encoded_path}" + (("?" + querystring) if querystring else "")
+    url = f"https://{context.s3_host}{encoded_path}" + (
+        ("?" + querystring) if querystring else ""
+    )
 
-    body = payload if method == "PUT" else None
+    body = payload if method in ("PUT", "POST") else None
+
     request = HTTPRequest(url, method=method, headers=headers, body=body)
 
     try:
-        response = yield AsyncHTTPClient().fetch(request)
+        response = yield _fetch_with_retry(request)
     except HTTPClientError as exception:
         if exception.response.code != 404:
             context.logger.warning(exception.response.body)
@@ -883,8 +1030,42 @@ def _make_s3_request(context, method, path, query, api_pre_auth_headers, payload
     return response
 
 
+# ---------------------------------------------------------------------
+# Networking resiliency helpers
+
+
+def _retryable(exc):
+    """Return True if the exception should trigger a retry."""
+    if isinstance(exc, HTTPClientError):
+        # Keep 429 (Too Many Requests), 5xx, and Tornado timeout (599) retryable
+        return exc.code in (429, 599) or 500 <= exc.code < 600
+    # Built-in TimeoutError (rare) – retry
+    return isinstance(exc, TimeoutError)
+
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=0.25, min=0.25, max=4),
+    retry=retry_if_exception(_retryable),
+)
+@gen.coroutine
+def _fetch_with_retry(request):
+    """Thin wrapper around the shared AsyncHTTPClient with back-off."""
+    response = yield HTTP_CLIENT.fetch(request)
+    return response
+
+
 def _aws_sig_v4_headers(
-    access_key_id, secret_access_key, pre_auth_headers, service, region, host, method, path, query, payload
+    access_key_id,
+    secret_access_key,
+    pre_auth_headers,
+    service,
+    region,
+    host,
+    method,
+    path,
+    query,
+    payload,
 ):
     algorithm = "AWS4-HMAC-SHA256"
 
@@ -895,7 +1076,8 @@ def _aws_sig_v4_headers(
     credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
 
     pre_auth_headers_lower = {
-        header_key.lower(): " ".join(header_value.split()) for header_key, header_value in pre_auth_headers.items()
+        header_key.lower(): " ".join(header_value.split())
+        for header_key, header_value in pre_auth_headers.items()
     }
     required_headers = {
         "host": host,
@@ -910,10 +1092,15 @@ def _aws_sig_v4_headers(
         def canonical_request():
             canonical_uri = urllib.parse.quote(path, safe="/~")
             quoted_query = sorted(
-                (urllib.parse.quote(key, safe="~"), urllib.parse.quote(value, safe="~")) for key, value in query.items()
+                (urllib.parse.quote(key, safe="~"), urllib.parse.quote(value, safe="~"))
+                for key, value in query.items()
             )
-            canonical_querystring = "&".join(f"{key}={value}" for key, value in quoted_query)
-            canonical_headers = "".join(f"{key}:{headers[key]}\n" for key in header_keys)
+            canonical_querystring = "&".join(
+                f"{key}={value}" for key, value in quoted_query
+            )
+            canonical_headers = "".join(
+                f"{key}:{headers[key]}\n" for key in header_keys
+            )
 
             return (
                 f"{method}\n{canonical_uri}\n{canonical_querystring}\n"
